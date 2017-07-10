@@ -1,6 +1,6 @@
 kernel:
-  image: "linuxkitprojects/kernel:4.10_dbg-06f822b6a73c5a4b8188624c13841f9f32a2cb0e-dirty"
-  cmdline: "console=ttyS0 console=tty0 page_poison=1"
+  image: "linuxkitprojects/kernel-memorizer:4.10-e1f32a65fff3fcab3ab084b8d55d6ee208136c90-dirty"
+  cmdline: "console=ttyS0 page_poison=1"
 init:
   - linuxkit/init:14a38303ee9dcb4541c00e2b87404befc1ba2083
   - linuxkit/runc:2310ad9d266cf5d9c4d07613bd2135ed7eb8a21f
@@ -13,7 +13,7 @@ services:
   - name: getty
     image: "linuxkit/getty:5ab31289889d61a5d2ecbeea8e36ce74ac54737c"
     env:
-     - INSECURE=true
+      - INSECURE=true
 trust:
-  org:
+    org:
     - linuxkit
