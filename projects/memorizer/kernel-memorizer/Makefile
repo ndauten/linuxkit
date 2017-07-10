@@ -16,7 +16,7 @@
 HASH?=$(shell git ls-tree HEAD -- ../$(notdir $(CURDIR)) | awk '{print $$3}')
 # Name and Org on Hub
 ORG?=linuxkitprojects
-IMAGE:=kernel
+IMAGE:=kernel-memorizer
 IMAGE_PERF:=kernel-perf
 
 # Add '-dirty' to hash if the repository is not clean. make does not
