@@ -18,64 +18,82 @@ is a work in progress.
 [Type 1]:https://www.packet.net/bare-metal/servers/type-1/
 [Type 2A]:https://www.packet.net/bare-metal/servers/type-2a/
 
+The `linuxkit run packet` command can mostly either be configured via
+command line options or with environment variables. see `linuxkit run
+packet --help` for the options and environment variables.
+
+By default, `linuxkit run` will provision a new machine and remove it
+once you are done. With the `-keep` option the provisioned machine
+will not be removed. You can then use the `-device` option with the
+device ID on subsequent `linuxkit run` invocations to re-use an
+existing machine. These subsequent runs will update the iPXE data so
+you can boot alternative kernels on an existing machine.
+
+**Note**: The update of the iPXE configuration sometimes may take some
+time and the first boot may fail. Hitting return on the console to
+retry the boot typically fixes this.
+
 ## Boot
 
-Build an image with `moby build`. The [packet.yml](https://github.com/vielmetti/linuxkit/blob/master/examples/packet.yml)
-example file provides a suitable template to start from.
+LinuxKit on Packet boots the `kernel+initrd` output from moby
+via
+[iPXE](https://help.packet.net/technical/infrastructure/custom-ipxe). iPXE
+booting requires a HTTP server on which you can store your images. The
+`-base-url` option specifies the URL to the HTTP server.
 
-Linuxkit on Packet [boots via iPXE]. This requires that you have
-an HTTP server on which you can store your images. At the moment
-there is no equivalent to "linuxkit push" to upload these images,
-so you will have to host them yourself. The images can be served
-from any HTTP server, though in the interest of performance you may
-want to locate those images near the data center that you're booting in.
+If you don't have a public HTTP server at hand, you can use the
+`-serve` option. This will create a local HTTP server which can either
+be run on another Packet machine or be made accessible with tools
+like [ngrok](https://ngrok.com/).
 
-[boots via iPXE]:https://help.packet.net/technical/infrastructure/custom-ipxe
+For example, to boot the toplevel [linuxkit.yml](../linuxkit.yml)
+example with a local HTTP server:
 
-Servers take several minutes to provision. During this time their
-state can be seen from the Packet console.
-
+```sh
+moby build linuxkit.yml
+# run the web server
+# run 'ngrok http 8080' in another window
+PACKET_API_KEY=<API key> linuxkit run packet -serve :8080 -base-url http://9b828514.ngrok.io -project-id <Project ID> linuxkit
 ```
-$ linuxkit run packet --help
-USAGE: linuxkit run packet [options] [name]
 
-Options:
+To boot a `arm64` kernel on a Type 2a machine (`-machine
+baremetal_2a`) you currently need to un-compress both the kernel and
+the initrd before booting, e.g:
+```
+mv linuxkit-initrd.img linuxkit-initrd.img.gz && gzip -d linuxkit-initrd.img.gz
+mv linuxkit-kernel.img linuxkit-kernel.img.gz && gzip -d linuxkit-kernel.img.gz
+```
 
-  -api-key string
-    	Packet API key
-  -base-url string
-    	Base URL that the kernel and initrd are served from.
-  -hostname string
-    	Hostname of new instance (default "moby")
-  -img-name string
-    	Overrides the prefix used to identify the files. Defaults to [name]
-  -machine string
-    	Packet Machine Type (default "baremetal_0")
-  -project-id string
-    	Packet Project ID
-  -zone string
-    	Packet Zone (default "ams1")
- ```
+**Note**: It may take several minutes to deploy a new server. If you
+are attached to the console, you should see the BIOS and the boot
+messages.
+
+
+
 ## Console
 
-If your LinuxKit system does not include an ssh or remote console 
-application, you can still connect to it via the Packet SOS ("Serial over SSH")
-console. See https://help.packet.net/technical/networking/sos-rescue-mode
-for details on that mode.
+By default, `linuxkit run packet ...` will connect to the
+Packet
+[SOS ("Serial over SSH") console](https://help.packet.net/technical/networking/sos-rescue-mode). This
+requires `ssh` access, i.e., you must have uploaded your SSH keys to
+Packet beforehand.
+
+You can exit the console vi `~.` on a new line once you are
+disconnected from the serial, e.g. after poweroff.
+
+**Note**: We also require that the Packet SOS host is in your
+`known_hosts` file, otherwise the connection to the console will
+fail. There is a Packet SOS host per zone.
+
+You can disable the serial console access with the `-console=false`
+command line option.
+
 
 ## Disks
 
 At this moment the Linuxkit server boots from RAM, with no persistent
-storage and there is no code that mounts disks. As a result,
-when the Linuxkit image reboots, all is lost. 
+storage.  We are working on adding persistent storage support on Packet.
 
-Packet supports a [persistent iPXE] mode through its API
-which would allow a server to come back up after a reboot
-and re-start the PXE process. This is great for testing your
-provisioning scripts. This is not yet available directly
-through Linuxkit.
-
-[persistent iPXE]:https://help.packet.net/technical/infrastructure/custom-ipxe
 
 ## Networking
 

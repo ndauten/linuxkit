@@ -1,7 +1,8 @@
-FROM linuxkit/alpine:24fe1b6bbf1fc95b484741587acb10da6dbc9211 AS mirror
+FROM linuxkit/alpine:a120ad6aead3fe583eaa20e9b75a05ac1b3487da AS mirror
 RUN mkdir -p /out/etc/apk && cp -r /etc/apk/* /out/etc/apk/
 # btrfs-progfs is required for btrfs test (mkfs.btrfs)
 # util-linux is required for btrfs test (losetup)
+# xfsprogs is required for xfs test (mkfs.xfs)
 RUN apk add --no-cache --initdb -p /out \
     alpine-baselayout \
     busybox \
@@ -14,19 +15,18 @@ RUN apk add --no-cache --initdb -p /out \
     linux-headers \
     make \
     musl \
-    util-linux
+    util-linux \
+    xfsprogs \
+    tzdata
 RUN rm -rf /out/etc/apk /out/lib/apk /out/var/cache
+RUN cp /out/usr/share/zoneinfo/UTC /out/etc/localtime
 
 FROM scratch
 COPY --from=mirror /out/ /
+COPY --from=mirror /go/src/github.com/containerd/containerd /go/src/github.com/containerd/containerd/
 ENV GOPATH=/go
-RUN mkdir -p $GOPATH/src/github.com/containerd && \
-  cd $GOPATH/src/github.com/containerd && \
-  git clone https://github.com/containerd/containerd.git
 WORKDIR $GOPATH/src/github.com/containerd/containerd
-# CONTAINERD_COMMIT is defined in linuxkit/alpine
-RUN git checkout $CONTAINERD_COMMIT
 ADD run.sh ./run.sh
 
 ENTRYPOINT ["/bin/sh", "run.sh"]
-LABEL org.mobyproject.config='{"net": "host", "capabilities": ["all"], "tmpfs": ["/tmp:exec"], "binds": ["/dev:/dev"]}'
+LABEL org.mobyproject.config='{"capabilities": ["all"], "tmpfs": ["/tmp"], "binds": ["/dev:/dev", "/var/lib:/var/lib", "/etc/resolv.conf:/etc/resolv.conf", "/usr/bin/runc:/usr/bin/runc", "/usr/bin/containerd:/usr/bin/containerd", "/usr/bin/containerd-shim:/usr/bin/containerd-shim"], "mounts": [{"type": "cgroup", "options": ["rw","nosuid","noexec","nodev","relatime"]}],}'

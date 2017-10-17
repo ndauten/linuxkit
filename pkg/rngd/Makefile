@@ -1,4 +1,4 @@
 IMAGE=rngd
-NETWORK=1
+DEPS:=$(wildcard cmd/rngd/*.go) $(shell find cmd/rngd/vendor)
 
 include ../package.mk

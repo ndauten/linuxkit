@@ -1,15 +1,20 @@
-FROM alpine:3.6 AS mirror
+ARG BASE=alpine:3.6
+FROM $BASE AS mirror
 
 # update base image
 RUN apk update && apk upgrade -a
 
 # Copy Dockerfile so we can include it in the hash
 COPY Dockerfile /Dockerfile
-COPY packages /tmp/
+COPY packages* /tmp/
 
 # mirror packages
-RUN mkdir -p /mirror/$(uname -m) && \
+RUN cat /tmp/packages.$(uname -m) >> /tmp/packages && \
+   mkdir -p /mirror/$(uname -m) && \
    apk fetch --recursive -o /mirror/$(uname -m) $(apk info; cat /tmp/packages)
+
+# add the tools for WireGuard, since the kernel module is now included, but from edge/testing
+RUN apk fetch --recursive -o /mirror/$(uname -m) -X http://dl-cdn.alpinelinux.org/alpine/edge/testing -U wireguard-tools
 
 # install abuild for signing
 RUN apk add --no-cache abuild
@@ -24,12 +29,6 @@ RUN apk index --rewrite-arch $(uname -m) -o /mirror/$(uname -m)/APKINDEX.unsigne
 RUN cp /mirror/$(uname -m)/APKINDEX.unsigned.tar.gz /mirror/$(uname -m)/APKINDEX.tar.gz
 RUN abuild-sign /mirror/$(uname -m)/APKINDEX.tar.gz
 
-# fetch OVMF for qemu EFI boot (this is not added as a package)
-RUN apk add -X http://dl-cdn.alpinelinux.org/alpine/edge/community ovmf
-
-# add the tools for WireGuard, since the kernel module is now included
-RUN apk add -X http://dl-cdn.alpinelinux.org/alpine/edge/testing -U wireguard-tools
-
 # set this as our repo but keep a copy of the upstream for downstream use
 RUN mv /etc/apk/repositories /etc/apk/repositories.upstream && echo "/mirror" > /etc/apk/repositories && apk update
 
@@ -41,18 +40,27 @@ RUN go get -u github.com/golang/lint/golint
 RUN go get -u github.com/gordonklaus/ineffassign
 RUN go get -u github.com/LK4D4/vndr
 
-FROM alpine:3.6
+# checkout containerd
+# Update `FROM` in `pkg/containerd/Dockerfile`, `pkg/init/Dockerfile` and
+# `test/pkg/containerd/Dockerfile` when changing this.
+ENV CONTAINERD_REPO=https://github.com/containerd/containerd.git
+ENV CONTAINERD_COMMIT=v1.0.0-alpha4
+RUN mkdir -p $GOPATH/src/github.com/containerd && \
+  cd $GOPATH/src/github.com/containerd && \
+  git clone https://github.com/containerd/containerd.git && \
+  cd $GOPATH/src/github.com/containerd/containerd && \
+  git checkout $CONTAINERD_COMMIT
+
+FROM $BASE
 
 COPY --from=mirror /etc/apk/repositories /etc/apk/repositories
 COPY --from=mirror /etc/apk/repositories.upstream /etc/apk/repositories.upstream
 COPY --from=mirror /etc/apk/keys /etc/apk/keys/
 COPY --from=mirror /mirror /mirror/
 COPY --from=mirror /go/bin /go/bin/
-COPY --from=mirror /usr/share/ovmf/bios.bin /usr/share/ovmf/bios.bin
 COPY --from=mirror /Dockerfile /Dockerfile
+COPY --from=mirror /go/src/github.com/containerd/containerd /go/src/github.com/containerd/containerd/
 
 RUN apk update && apk upgrade -a
 
-# v1.0.0-alpha1 plus https://github.com/containerd/containerd/pull/1141
-ENV CONTAINERD_REPO=https://github.com/ijc/containerd.git
-ENV CONTAINERD_COMMIT=d42cb88ba2b08d2ca6c8c017d629b394bf1dd08c
+ENV GOPATH=/go PATH=$PATH:/go/bin

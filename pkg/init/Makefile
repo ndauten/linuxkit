@@ -1,4 +1,4 @@
 IMAGE=init
-DEPS=init usermode-helper.c $(wildcard etc/*) $(wildcard etc/init.d/*)
+DEPS=usermode-helper.c $(wildcard etc/*) $(wildcard etc/init.d/*) $(shell find cmd -type f)
 
 include ../package.mk

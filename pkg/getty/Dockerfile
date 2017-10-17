@@ -1,4 +1,4 @@
-FROM linuxkit/alpine:a39a433162a873519910a07beeb3e8db22529956 AS mirror
+FROM linuxkit/alpine:87a0cd10449d72f374f950004467737dbf440630 AS mirror
 
 RUN mkdir -p /out/etc/apk && cp -r /etc/apk/* /out/etc/apk/
 RUN apk add --no-cache --initdb -p /out \
@@ -9,6 +9,7 @@ RUN apk add --no-cache --initdb -p /out \
     musl \
     tini \
     util-linux \
+    wireguard-tools \
     && true
 RUN mv /out/etc/apk/repositories.upstream /out/etc/apk/repositories
 
@@ -31,4 +32,4 @@ COPY --from=mirror /out/ /
 COPY usr/ /usr/
 COPY etc/ /etc/
 CMD ["/usr/bin/rungetty.sh"]
-LABEL org.mobyproject.config='{"pid": "host", "net":"host", "binds": ["/run:/run", "/tmp:/tmp", "/etc:/hostroot/etc", "/usr/bin/ctr:/usr/bin/ctr", "/usr/bin/runc:/usr/bin/runc", "/containers:/containers","/dev:/dev","/sys:/sys"], "capabilities": ["all"]}'
+LABEL org.mobyproject.config='{"pid": "host", "net":"host", "binds": ["/etc/resolv.conf:/etc/resolv.conf", "/run:/run", "/tmp:/tmp", "/etc:/hostroot/etc", "/usr/bin/ctr:/usr/bin/ctr", "/usr/bin/runc:/usr/bin/runc", "/containers:/containers","/var/log:/var/log","/dev:/dev","/sys:/sys"], "capabilities": ["all"]}'

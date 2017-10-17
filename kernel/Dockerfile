@@ -1,4 +1,4 @@
-FROM linuxkit/alpine:9bcf61f605ef0ce36cc94d59b8eac307862de6e1 AS kernel-build
+FROM linuxkit/alpine:a120ad6aead3fe583eaa20e9b75a05ac1b3487da AS kernel-build
 RUN apk add \
     argp-standalone \
     automake \
@@ -24,58 +24,38 @@ RUN apk add \
     tar \
     xz \
     xz-dev \
-    zlib-dev && \
+    zlib-dev
+
 # libunwind-dev pkg is missed from arm64 now, below statement will be removed if the pkg is available.
-    if [ $(uname -m) == x86_64 ]; then \
-        apk add libunwind-dev; \
-    fi
+RUN [ $(uname -m) == x86_64 ] && apk add libunwind-dev || true
 
 ARG KERNEL_VERSION
 ARG KERNEL_SERIES
-ARG DEBUG
+ARG EXTRA
 
 ENV KERNEL_SOURCE=https://www.kernel.org/pub/linux/kernel/v4.x/linux-${KERNEL_VERSION}.tar.xz
 ENV KERNEL_SHA256_SUMS=https://www.kernel.org/pub/linux/kernel/v4.x/sha256sums.asc
 ENV KERNEL_PGP2_SIGN=https://www.kernel.org/pub/linux/kernel/v4.x/linux-${KERNEL_VERSION}.tar.sign
 
-ENV WIREGUARD_VERSION=0.0.20170706
-ENV WIREGUARD_SHA256=5763b9436265421a67f92cb82142042867fc87c573ecc18033d40c1476146c33
+ENV WIREGUARD_VERSION=0.0.20170810
+ENV WIREGUARD_SHA256=ab96230390625aad6f4816fa23aef6e9f7fee130f083d838919129ff12089bf7
 ENV WIREGUARD_URL=https://git.zx2c4.com/WireGuard/snapshot/WireGuard-${WIREGUARD_VERSION}.tar.xz
 
 # PGP keys: 589DA6B1 (greg@kroah.com) & 6092693E (autosigner@kernel.org) & 00411886 (torvalds@linux-foundation.org)
 COPY keys.asc keys.asc
 
 # Download and verify kernel
+COPY sources/ /
 RUN curl -fsSLO ${KERNEL_SHA256_SUMS} && \
     gpg2 -q --import keys.asc && \
     gpg2 --verify sha256sums.asc && \
     KERNEL_SHA256=$(grep linux-${KERNEL_VERSION}.tar.xz sha256sums.asc | cut -d ' ' -f 1) && \
-    curl -fsSLO ${KERNEL_SOURCE} && \
+    [ -f linux-${KERNEL_VERSION}.tar.xz ] || curl -fsSLO ${KERNEL_SOURCE} && \
     echo "${KERNEL_SHA256}  linux-${KERNEL_VERSION}.tar.xz" | sha256sum -c - && \
     xz -d linux-${KERNEL_VERSION}.tar.xz && \
     curl -fsSLO ${KERNEL_PGP2_SIGN} && \
     gpg2 --verify linux-${KERNEL_VERSION}.tar.sign linux-${KERNEL_VERSION}.tar && \
     cat linux-${KERNEL_VERSION}.tar | tar --absolute-names -x && mv /linux-${KERNEL_VERSION} /linux
-
-# When using COPY with more than one source file, the destination must be a directory and end with a /
-COPY kernel_config-${KERNEL_SERIES}* /linux/
-COPY kernel_config.debug /linux/debug_config
-
-RUN case $(uname -m) in \
-    x86_64) \
-        KERNEL_DEF_CONF=/linux/arch/x86/configs/x86_64_defconfig; \
-        cp /linux/kernel_config-${KERNEL_SERIES} ${KERNEL_DEF_CONF}; \
-        ;; \
-    aarch64) \
-        KERNEL_DEF_CONF=/linux/arch/arm64/configs/defconfig; \
-        cp /linux/kernel_config-${KERNEL_SERIES}-aarch64 ${KERNEL_DEF_CONF}; \
-        ;; \
-    esac  && \
-    if [ -n "${DEBUG}" ]; then \
-        sed -i 's/CONFIG_PANIC_ON_OOPS=y/# CONFIG_PANIC_ON_OOPS is not set/' ${KERNEL_DEF_CONF}; \
-        cat /linux/debug_config >> ${KERNEL_DEF_CONF}; \
-    fi && \
-    rm /linux/kernel_config-${KERNEL_SERIES}*
 
 # Apply local patches
 COPY patches-${KERNEL_SERIES} /patches
@@ -85,12 +65,34 @@ RUN set -e && for patch in /patches/*.patch; do \
         patch -p1 < "$patch"; \
     done
 
+# Kernel config
+COPY kernel_config* /linux/
+
+RUN case $(uname -m) in \
+    x86_64) \
+        KERNEL_DEF_CONF=/linux/arch/x86/configs/x86_64_defconfig; \
+        ;; \
+    aarch64) \
+        KERNEL_DEF_CONF=/linux/arch/arm64/configs/defconfig; \
+        ;; \
+    esac  && \
+    cp /linux/kernel_config-${KERNEL_SERIES}-$(uname -m) ${KERNEL_DEF_CONF}; \
+    if [ -n "${EXTRA}" ]; then \
+        sed -i "s/CONFIG_LOCALVERSION=\"-linuxkit\"/CONFIG_LOCALVERSION=\"-linuxkit${EXTRA}\"/" ${KERNEL_DEF_CONF}; \
+        if [ "${EXTRA}" = "-dbg" ]; then \
+            sed -i 's/CONFIG_PANIC_ON_OOPS=y/# CONFIG_PANIC_ON_OOPS is not set/' ${KERNEL_DEF_CONF}; \
+        fi && \
+        cat /linux/kernel_config${EXTRA} >> ${KERNEL_DEF_CONF}; \
+    fi && \
+    rm /linux/kernel_config* && \
+    make defconfig && \
+    make oldconfig && \
+    if [ -z "${EXTRA}" ]; then diff .config ${KERNEL_DEF_CONF}; fi
+
 RUN mkdir /out
 
 # Kernel
-RUN make defconfig && \
-    make oldconfig && \
-    make -j "$(getconf _NPROCESSORS_ONLN)" KCFLAGS="-fno-pie" && \
+RUN make -j "$(getconf _NPROCESSORS_ONLN)" KCFLAGS="-fno-pie" && \
     case $(uname -m) in \
     x86_64) \
         cp arch/x86_64/boot/bzImage /out/kernel; \
@@ -100,7 +102,7 @@ RUN make defconfig && \
         ;; \
     esac && \
     cp System.map /out && \
-    ([ -n "${DEBUG}" ] && cp vmlinux /out || true)
+    ([ "${EXTRA}" = "-dbg" ] && cp vmlinux /out || true)
 
 # WireGuard
 RUN curl -sSL -o /wireguard.tar.xz "${WIREGUARD_URL}" && \

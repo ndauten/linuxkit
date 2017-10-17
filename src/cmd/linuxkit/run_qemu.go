@@ -1,21 +1,28 @@
 package main
 
 import (
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/satori/go.uuid"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh/terminal"
 )
 
 // QemuImg is the version of qemu container
-const QemuImg = "linuxkit/qemu:bc5e096d3b440509954aa9341db3ff4d3d615344"
+const (
+	QemuImg       = "linuxkit/qemu:4eb19447a221052654276cdf57effa20b672b081"
+	defaultFWPath = "/usr/share/ovmf/bios.bin"
+)
 
 // QemuConfig contains the config for Qemu
 type QemuConfig struct {
@@ -26,6 +33,7 @@ type QemuConfig struct {
 	GUI            bool
 	Disks          Disks
 	MetadataPath   string
+	StatePath      string
 	FWPath         string
 	Arch           string
 	CPUs           string
@@ -35,6 +43,29 @@ type QemuConfig struct {
 	QemuBinPath    string
 	QemuImgPath    string
 	PublishedPorts []string
+	NetdevConfig   string
+	UUID           uuid.UUID
+}
+
+const (
+	qemuNetworkingNone    string = "none"
+	qemuNetworkingUser           = "user"
+	qemuNetworkingTap            = "tap"
+	qemuNetworkingBridge         = "bridge"
+	qemuNetworkingDefault        = qemuNetworkingUser
+)
+
+var (
+	defaultArch string
+)
+
+func init() {
+	switch runtime.GOARCH {
+	case "arm64":
+		defaultArch = "aarch64"
+	case "amd64":
+		defaultArch = "x86_64"
+	}
 }
 
 func haveKVM() bool {
@@ -55,6 +86,39 @@ func envOverrideBool(env string, b *bool) {
 	}
 }
 
+func retrieveMAC(statePath string) net.HardwareAddr {
+	var mac net.HardwareAddr
+	fileName := filepath.Join(statePath, "mac-addr")
+
+	if macString, err := ioutil.ReadFile(fileName); err == nil {
+		if mac, err = net.ParseMAC(string(macString)); err != nil {
+			log.Fatal("failed to parse mac-addr file: %s\n", macString)
+		}
+	} else {
+		// we did not generate a mac yet. generate one
+		mac = generateMAC()
+		if err = ioutil.WriteFile(fileName, []byte(mac.String()), 0640); err != nil {
+			log.Fatalln("failed to write mac-addr file:", err)
+		}
+	}
+
+	return mac
+}
+
+func generateMAC() net.HardwareAddr {
+	mac := make([]byte, 6)
+	n, err := rand.Read(mac)
+	if err != nil {
+		log.WithError(err).Fatal("failed to generate random mac address")
+	}
+	if n != 6 {
+		log.WithError(err).Fatal("generated %d bytes for random mac address", n)
+	}
+	mac[0] &^= 0x01 // Clear multicast bit
+	mac[0] |= 0x2   // Set locally administered bit
+	return net.HardwareAddr(mac)
+}
+
 func runQemu(args []string) {
 	invoked := filepath.Base(os.Args[0])
 	flags := flag.NewFlagSet("qemu", flag.ExitOnError)
@@ -64,6 +128,10 @@ func runQemu(args []string) {
 		fmt.Printf("\n")
 		fmt.Printf("Options:\n")
 		flags.PrintDefaults()
+		fmt.Printf("\n")
+		fmt.Printf("If not running as root note that '-networking bridge,br0' requires a\n")
+		fmt.Printf("setuid network helper and appropriate host configuration, see\n")
+		fmt.Printf("http://wiki.qemu.org/Features/HelperNetworking.\n")
 	}
 
 	// Display flags
@@ -83,16 +151,23 @@ func runQemu(args []string) {
 	data := flags.String("data", "", "Metadata to pass to VM (either a path to a file or a string)")
 
 	// Paths and settings for UEFI firware
-	fw := flags.String("fw", "/usr/share/ovmf/bios.bin", "Path to OVMF firmware for UEFI boot")
+	// Note, we do not use defaultFWPath here as we have a special case for containerised execution
+	fw := flags.String("fw", "", "Path to OVMF firmware for UEFI boot")
 
 	// VM configuration
 	enableKVM := flags.Bool("kvm", haveKVM(), "Enable KVM acceleration")
-	arch := flags.String("arch", "x86_64", "Type of architecture to use, e.g. x86_64, aarch64")
+	arch := flags.String("arch", defaultArch, "Type of architecture to use, e.g. x86_64, aarch64")
 	cpus := flags.String("cpus", "1", "Number of CPUs")
 	mem := flags.String("mem", "1024", "Amount of memory in MB")
 
 	// Backend configuration
 	qemuContainerized := flags.Bool("containerized", false, "Run qemu in a container")
+
+	// Generate UUID, so that /sys/class/dmi/id/product_uuid is populated
+	vmUUID := uuid.NewV4()
+
+	// Networking
+	networking := flags.String("networking", qemuNetworkingDefault, "Networking mode. Valid options are 'default', 'user', 'bridge[,name]', tap[,name] and 'none'. 'user' uses QEMUs userspace networking. 'bridge' connects to a preexisting bridge. 'tap' uses a prexisting tap device. 'none' disables networking.`")
 
 	publishFlags := multipleFlag{}
 	flags.Var(&publishFlags, "publish", "Publish a vm's port(s) to the host (default [])")
@@ -132,22 +207,14 @@ func runQemu(args []string) {
 			*isoBoot = true
 			prefix = strings.TrimSuffix(path, ".iso")
 		}
-		// autodetect EFI ISO from our default naming
-		if strings.HasSuffix(path, "-efi.iso") {
-			*uefiBoot = true
-			prefix = strings.TrimSuffix(path, "-efi.iso")
-		}
 	}
 
 	if *state == "" {
 		*state = prefix + "-state"
 	}
-	var mkstate func()
-	mkstate = func() {
-		if err := os.MkdirAll(*state, 0755); err != nil {
-			log.Fatalf("Could not create state directory: %v", err)
-		}
-		mkstate = func() {}
+
+	if err := os.MkdirAll(*state, 0755); err != nil {
+		log.Fatalf("Could not create state directory: %v", err)
 	}
 
 	isoPath := ""
@@ -161,7 +228,6 @@ func runQemu(args []string) {
 				log.Fatalf("Cannot read user data: %v", err)
 			}
 		}
-		mkstate()
 		isoPath = filepath.Join(*state, "data.iso")
 		if err := WriteMetadataISO(isoPath, d); err != nil {
 			log.Fatalf("Cannot write user data ISO: %v", err)
@@ -177,7 +243,6 @@ func runQemu(args []string) {
 			d.Format = "qcow2"
 		}
 		if d.Size != 0 && d.Path == "" {
-			mkstate()
 			d.Path = filepath.Join(*state, "disk"+id+".img")
 		}
 		if d.Path == "" {
@@ -199,6 +264,40 @@ func runQemu(args []string) {
 	if *isoBoot && isoPath != "" {
 		log.Fatalf("metadata and ISO boot currently cannot coexist")
 	}
+	if *networking == "" || *networking == "default" {
+		dflt := qemuNetworkingDefault
+		networking = &dflt
+	}
+	netMode := strings.SplitN(*networking, ",", 2)
+
+	var netdevConfig string
+	switch netMode[0] {
+	case qemuNetworkingUser:
+		netdevConfig = "user"
+	case qemuNetworkingTap:
+		if len(netMode) != 2 {
+			log.Fatalf("Not enough arugments for %q networking mode", qemuNetworkingTap)
+		}
+		if len(publishFlags) != 0 {
+			log.Fatalf("Port publishing requires %q networking mode", qemuNetworkingUser)
+		}
+		netdevConfig = fmt.Sprintf("tap,ifname=%s,script=no,downscript=no", netMode[1])
+	case qemuNetworkingBridge:
+		if len(netMode) != 2 {
+			log.Fatalf("Not enough arugments for %q networking mode", qemuNetworkingBridge)
+		}
+		if len(publishFlags) != 0 {
+			log.Fatalf("Port publishing requires %q networking mode", qemuNetworkingUser)
+		}
+		netdevConfig = fmt.Sprintf("bridge,br=%s", netMode[1])
+	case qemuNetworkingNone:
+		if len(publishFlags) != 0 {
+			log.Fatalf("Port publishing requires %q networking mode", qemuNetworkingUser)
+		}
+		netdevConfig = ""
+	default:
+		log.Fatalf("Invalid networking mode: %s", netMode[0])
+	}
 
 	config := QemuConfig{
 		Path:           path,
@@ -208,6 +307,7 @@ func runQemu(args []string) {
 		GUI:            *enableGUI,
 		Disks:          disks,
 		MetadataPath:   isoPath,
+		StatePath:      *state,
 		FWPath:         *fw,
 		Arch:           *arch,
 		CPUs:           *cpus,
@@ -215,6 +315,8 @@ func runQemu(args []string) {
 		KVM:            *enableKVM,
 		Containerized:  *qemuContainerized,
 		PublishedPorts: publishFlags,
+		NetdevConfig:   netdevConfig,
+		UUID:           vmUUID,
 	}
 
 	config = discoverBackend(config)
@@ -253,6 +355,9 @@ func runQemuLocal(config QemuConfig) error {
 
 	// Check for OVMF firmware before running
 	if config.UEFI {
+		if config.FWPath == "" {
+			config.FWPath = defaultFWPath
+		}
 		if _, err := os.Stat(config.FWPath); err != nil {
 			if os.IsNotExist(err) {
 				return fmt.Errorf("File [%s] does not exist, please ensure OVMF is installed", config.FWPath)
@@ -302,11 +407,16 @@ func runQemuContainer(config QemuConfig) error {
 	var args []string
 	config, args = buildQemuCmdline(config)
 
-	// if user specify the "-fw" parameter, this should override the default in container context,
-	// with "-v" option, we will have the chance to assign an external FW binary to the containerized qemu
-	// instead of the fixed FW bin instealled by the build process of the image.
+	// If we are running in a container and if the the user
+	// does not specify the "-fw" parameter, we default to using the
+	// FW image in the container. Otherwise we bind mount the FW image
+	// into the container.
 	if config.UEFI {
-		binds = append(binds, "-v", fmt.Sprintf("%[1]s:%[1]s", config.FWPath))
+		if config.FWPath != "" {
+			binds = append(binds, "-v", fmt.Sprintf("%[1]s:%[1]s", config.FWPath))
+		} else {
+			config.FWPath = defaultFWPath
+		}
 	}
 
 	dockerArgs := append([]string{"run", "--interactive", "--rm", "-w", cwd}, binds...)
@@ -377,10 +487,16 @@ func buildQemuCmdline(config QemuConfig) (QemuConfig, []string) {
 	qemuArgs = append(qemuArgs, "-device", "virtio-rng-pci")
 	qemuArgs = append(qemuArgs, "-smp", config.CPUs)
 	qemuArgs = append(qemuArgs, "-m", config.Memory)
+	qemuArgs = append(qemuArgs, "-uuid", config.UUID.String())
+	qemuArgs = append(qemuArgs, "-pidfile", filepath.Join(config.StatePath, "qemu.pid"))
 	// Need to specify the vcpu type when running qemu on arm64 platform, for security reason,
 	// the vcpu should be "host" instead of other names such as "cortex-a53"...
 	if config.Arch == "aarch64" {
-		qemuArgs = append(qemuArgs, "-cpu", "host")
+		if runtime.GOARCH == "arm64" {
+			qemuArgs = append(qemuArgs, "-cpu", "host")
+		} else {
+			qemuArgs = append(qemuArgs, "-cpu", "cortex-a57")
+		}
 	}
 
 	if config.KVM {
@@ -421,7 +537,7 @@ func buildQemuCmdline(config QemuConfig) (QemuConfig, []string) {
 	}
 
 	if config.UEFI {
-		qemuArgs = append(qemuArgs, "-pflash", config.FWPath)
+		qemuArgs = append(qemuArgs, "-drive", "if=pflash,format=raw,file="+config.FWPath)
 	}
 
 	// build kernel boot config from kernel/initrd/cmdline
@@ -438,13 +554,16 @@ func buildQemuCmdline(config QemuConfig) (QemuConfig, []string) {
 		}
 	}
 
-	if config.PublishedPorts != nil && len(config.PublishedPorts) > 0 {
+	if config.NetdevConfig == "" {
+		qemuArgs = append(qemuArgs, "-net", "none")
+	} else {
+		mac := retrieveMAC(config.StatePath)
+		qemuArgs = append(qemuArgs, "-net", "nic,model=virtio,macaddr="+mac.String())
 		forwardings, err := buildQemuForwardings(config.PublishedPorts, config.Containerized)
 		if err != nil {
 			log.Error(err)
 		}
-		qemuArgs = append(qemuArgs, "-net", forwardings)
-		qemuArgs = append(qemuArgs, "-net", "nic")
+		qemuArgs = append(qemuArgs, "-net", config.NetdevConfig+forwardings)
 	}
 
 	if config.GUI != true {
@@ -538,7 +657,10 @@ func splitPublish(publish string) (publishedPorts, error) {
 }
 
 func buildQemuForwardings(publishFlags multipleFlag, containerized bool) (string, error) {
-	forwardings := "user"
+	if len(publishFlags) == 0 {
+		return "", nil
+	}
+	var forwardings string
 	for _, publish := range publishFlags {
 		p, err := splitPublish(publish)
 		if err != nil {

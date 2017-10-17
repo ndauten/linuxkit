@@ -1,41 +1,49 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"os/user"
+	"path"
 	"path/filepath"
+	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/packethost/packngo"
+	log "github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 const (
-	packetDefaultZone     = "ams1"
-	packetDefaultMachine  = "baremetal_0"
-	packetDefaultHostname = "moby"
-	packetBaseURL         = "PACKET_BASE_URL"
-	packetZoneVar         = "PACKET_ZONE"
-	packetMachineVar      = "PACKET_MACHINE"
-	packetAPIKeyVar       = "PACKET_API_KEY"
-	packetProjectIDVar    = "PACKET_PROJECT_ID"
-	packetHostnameVar     = "PACKET_HOSTNAME"
-	packetNameVar         = "PACKET_NAME"
+	packetDefaultZone    = "ams1"
+	packetDefaultMachine = "baremetal_0"
+	packetBaseURL        = "PACKET_BASE_URL"
+	packetZoneVar        = "PACKET_ZONE"
+	packetMachineVar     = "PACKET_MACHINE"
+	packetAPIKeyVar      = "PACKET_API_KEY"
+	packetProjectIDVar   = "PACKET_PROJECT_ID"
+	packetHostnameVar    = "PACKET_HOSTNAME"
+	packetNameVar        = "PACKET_NAME"
 )
 
-// ValidateHTTPURL does a sanity check that a URL returns a 200 or 300 response
-func ValidateHTTPURL(url string) {
-	log.Printf("Validating URL: %s", url)
-	resp, err := http.Head(url)
-	if err != nil {
-		log.Fatal(err)
+var (
+	packetDefaultHostname = "linuxkit"
+)
+
+func init() {
+	// Prefix host name with username
+	if u, err := user.Current(); err == nil {
+		packetDefaultHostname = u.Username + "-" + packetDefaultHostname
 	}
-	if resp.StatusCode >= 400 {
-		log.Fatal("Got a non 200- or 300- HTTP response code: %s", resp)
-	}
-	log.Printf("OK: %d response code", resp.StatusCode)
 }
 
 // Process the run arguments and execute run
@@ -47,13 +55,18 @@ func runPacket(args []string) {
 		fmt.Printf("Options:\n\n")
 		flags.PrintDefaults()
 	}
-	baseURLFlag := flags.String("base-url", "", "Base URL that the kernel and initrd are served from.")
-	zoneFlag := flags.String("zone", packetDefaultZone, "Packet Zone")
-	machineFlag := flags.String("machine", packetDefaultMachine, "Packet Machine Type")
-	apiKeyFlag := flags.String("api-key", "", "Packet API key")
-	projectFlag := flags.String("project-id", "", "Packet Project ID")
-	hostNameFlag := flags.String("hostname", packetDefaultHostname, "Hostname of new instance")
-	nameFlag := flags.String("img-name", "", "Overrides the prefix used to identify the files. Defaults to [name]")
+	baseURLFlag := flags.String("base-url", "", "Base URL that the kernel and initrd are served from (or "+packetBaseURL+")")
+	zoneFlag := flags.String("zone", packetDefaultZone, "Packet Zone (or "+packetZoneVar+")")
+	machineFlag := flags.String("machine", packetDefaultMachine, "Packet Machine Type (or "+packetMachineVar+")")
+	apiKeyFlag := flags.String("api-key", "", "Packet API key (or "+packetAPIKeyVar+")")
+	projectFlag := flags.String("project-id", "", "Packet Project ID (or "+packetProjectIDVar+")")
+	deviceFlag := flags.String("device", "", "The ID of an existing device")
+	hostNameFlag := flags.String("hostname", packetDefaultHostname, "Hostname of new instance (or "+packetHostnameVar+")")
+	nameFlag := flags.String("img-name", "", "Overrides the prefix used to identify the files. Defaults to [name] (or "+packetNameVar+")")
+	alwaysPXE := flags.Bool("always-pxe", true, "Reboot from PXE every time.")
+	serveFlag := flags.String("serve", "", "Serve local files via the http port specified, e.g. ':8080'.")
+	consoleFlag := flags.Bool("console", true, "Provide interactive access on the console.")
+	keepFlag := flags.Bool("keep", false, "Keep the machine after exiting/poweroff.")
 	if err := flags.Parse(args); err != nil {
 		log.Fatal("Unable to parse args")
 	}
@@ -82,35 +95,296 @@ func runPacket(args []string) {
 	name := getStringValue(packetNameVar, *nameFlag, prefix)
 	osType := "custom_ipxe"
 	billing := "hourly"
-	userData := fmt.Sprintf("#!ipxe\n\ndhcp\nset base-url %s\nset kernel-params ip=dhcp nomodeset ro serial console=ttyS1,115200\nkernel ${base-url}/%s-kernel ${kernel-params}\ninitrd ${base-url}/%s-initrd.img\nboot", url, name, name)
+
+	if !*keepFlag && !*consoleFlag {
+		log.Fatalf("Combination of keep=%t and console=%t makes little sense", *keepFlag, *consoleFlag)
+	}
+
+	// Read kernel command line
+	var cmdline string
+	if c, err := ioutil.ReadFile(prefix + "-cmdline"); err != nil {
+		log.Fatalf("Cannot open cmdline file: %v", err)
+	} else {
+		cmdline = string(c)
+	}
+
+	// Serve files with a local http server
+	var httpServer *http.Server
+	if *serveFlag != "" {
+		fs := serveFiles{[]string{fmt.Sprintf("%s-kernel", name), fmt.Sprintf("%s-initrd.img", name)}}
+		httpServer = &http.Server{Addr: ":8080", Handler: http.FileServer(fs)}
+		go func() {
+			log.Debugf("Listening on http://%s\n", *serveFlag)
+			if err := httpServer.ListenAndServe(); err != nil {
+				log.Infof("http server exited with: %v", err)
+			}
+		}()
+	}
+
+	// Build the iPXE script
+	// Note, we *append* the <prefix>-cmdline. iXPE booting will
+	// need the first set of "kernel-params" and we don't want to
+	// require these to be added to every YAML file.
+	userData := "#!ipxe\n\n"
+	userData += "dhcp\n"
+	userData += fmt.Sprintf("set base-url %s\n", url)
+	if *machineFlag != "baremetal_2a" {
+		userData += fmt.Sprintf("set kernel-params ip=dhcp nomodeset ro serial console=ttyS1,115200 %s\n", cmdline)
+		userData += fmt.Sprintf("kernel ${base-url}/%s-kernel ${kernel-params}\n", name)
+		userData += fmt.Sprintf("initrd ${base-url}/%s-initrd.img\n", name)
+	} else {
+		// With EFI boot need to specify the initrd and root dev explicitly. See:
+		// http://ipxe.org/appnote/debian_preseed
+		// http://forum.ipxe.org/showthread.php?tid=7589
+		userData += fmt.Sprintf("initrd --name initrd ${base-url}/%s-initrd.img\n", name)
+		userData += fmt.Sprintf("set kernel-params ip=dhcp nomodeset ro %s\n", cmdline)
+		userData += fmt.Sprintf("kernel ${base-url}/%s-kernel initrd=initrd root=/dev/ram0 ${kernel-params}\n", name)
+	}
+	userData += "boot"
 	log.Debugf("Using userData of:\n%s\n", userData)
+
+	// Make sure the URL works
 	initrdURL := fmt.Sprintf("%s/%s-initrd.img", url, name)
 	kernelURL := fmt.Sprintf("%s/%s-kernel", url, name)
-	ValidateHTTPURL(kernelURL)
-	ValidateHTTPURL(initrdURL)
+	validateHTTPURL(kernelURL)
+	validateHTTPURL(initrdURL)
+
 	client := packngo.NewClient("", apiKey, nil)
 	tags := []string{}
-	req := packngo.DeviceCreateRequest{
-		HostName:     hostname,
-		Plan:         plan,
-		Facility:     facility,
-		OS:           osType,
-		BillingCycle: billing,
-		ProjectID:    projectID,
-		UserData:     userData,
-		Tags:         tags,
+
+	var dev *packngo.Device
+	var err error
+	if *deviceFlag != "" {
+		dev, _, err = client.Devices.Get(*deviceFlag)
+		if err != nil {
+			log.Fatalf("Getting info for device %s failed: %v", *deviceFlag, err)
+		}
+		b, err := json.MarshalIndent(dev, "", "    ")
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Debugf("%s\n", string(b))
+
+		req := packngo.DeviceUpdateRequest{
+			HostName:  hostname,
+			UserData:  userData,
+			Locked:    dev.Locked,
+			Tags:      dev.Tags,
+			AlwaysPXE: *alwaysPXE,
+		}
+		dev, _, err = client.Devices.Update(*deviceFlag, &req)
+		if err != nil {
+			log.Fatalf("Update device %s failed: %v", *deviceFlag, err)
+		}
+		if _, err := client.Devices.Reboot(*deviceFlag); err != nil {
+			log.Fatalf("Rebooting device %s failed: %v", *deviceFlag, err)
+		}
+	} else {
+		// Create a new device
+		req := packngo.DeviceCreateRequest{
+			HostName:     hostname,
+			Plan:         plan,
+			Facility:     facility,
+			OS:           osType,
+			BillingCycle: billing,
+			ProjectID:    projectID,
+			UserData:     userData,
+			Tags:         tags,
+			AlwaysPXE:    *alwaysPXE,
+		}
+		dev, _, err = client.Devices.Create(&req)
+		if err != nil {
+			log.Fatalf("Creating device failed: %v", err)
+		}
 	}
-	d, _, err := client.Devices.Create(&req)
+	b, err := json.MarshalIndent(dev, "", "    ")
 	if err != nil {
 		log.Fatal(err)
 	}
-	b, err := json.MarshalIndent(d, "", "    ")
-	if err != nil {
-		log.Fatal(err)
-	}
-	// log response json if in verbose mode
 	log.Debugf("%s\n", string(b))
-	// TODO: poll events api for bringup (requires extpacknogo)
-	// TODO: connect to serial console (requires API extension to get SSH URI)
-	// TODO: add ssh keys via API registered keys
+
+	log.Printf("Booting %s...", dev.ID)
+
+	sshHost := "sos." + dev.Facility.Code + ".packet.net"
+	if *consoleFlag {
+		// Connect to the serial console
+		if err := sshSOS(dev.ID, sshHost); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Printf("Access the console with: ssh %s@%s", dev.ID, sshHost)
+
+		// if the serve option is present, wait till 'ctrl-c' is hit.
+		// Otherwise we wouldn't serve the files
+		if *serveFlag != "" {
+			stop := make(chan os.Signal, 1)
+			signal.Notify(stop, os.Interrupt)
+			log.Printf("Hit ctrl-c to stop http server")
+			<-stop
+		}
+	}
+
+	// Stop the http server before exiting
+	if *serveFlag != "" {
+		log.Debugf("Shutting down http server...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		httpServer.Shutdown(ctx)
+	}
+
+	if *keepFlag {
+		log.Printf("The machine is kept...")
+		log.Printf("Device ID: %s", dev.ID)
+		log.Printf("Serial:    ssh %s@%s", dev.ID, sshHost)
+	} else {
+		if _, err := client.Devices.Delete(dev.ID); err != nil {
+			log.Fatalf("Unable to delete device: %v", err)
+		}
+	}
+}
+
+// validateHTTPURL does a sanity check that a URL returns a 200 or 300 response
+func validateHTTPURL(url string) {
+	log.Infof("Validating URL: %s", url)
+	resp, err := http.Head(url)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if resp.StatusCode >= 400 {
+		log.Fatal("Got a non 200- or 300- HTTP response code: %s", resp)
+	}
+	log.Debugf("OK: %d response code", resp.StatusCode)
+}
+
+func sshSOS(user, host string) error {
+	log.Debugf("console: ssh %s@%s", user, host)
+
+	hostKey, err := sshHostKey(host)
+	if err != nil {
+		return fmt.Errorf("Host key not found. Maybe need to add it? %v", err)
+	}
+
+	sshConfig := &ssh.ClientConfig{
+		User:            user,
+		HostKeyCallback: ssh.FixedHostKey(hostKey),
+		Auth: []ssh.AuthMethod{
+			sshAgent(),
+		},
+	}
+
+	c, err := ssh.Dial("tcp", host+":22", sshConfig)
+	if err != nil {
+		return fmt.Errorf("Failed to dial: %s", err)
+	}
+
+	s, err := c.NewSession()
+	if err != nil {
+		return fmt.Errorf("Failed to create session: %v", err)
+	}
+	defer s.Close()
+
+	s.Stdout = os.Stdout
+	s.Stderr = os.Stderr
+	s.Stdin = os.Stdin
+
+	modes := ssh.TerminalModes{
+		ssh.ECHO:  0,
+		ssh.IGNCR: 1,
+	}
+
+	width, height, err := terminal.GetSize(0)
+	if err != nil {
+		log.Warningf("Error getting terminal size. Ignored. %v", err)
+		width = 80
+		height = 40
+	}
+	if err := s.RequestPty("vt100", width, height, modes); err != nil {
+		return fmt.Errorf("Request for PTY failed: %v", err)
+	}
+	oldState, err := terminal.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return err
+	}
+	defer terminal.Restore(0, oldState)
+
+	// Start remote shell
+	if err := s.Shell(); err != nil {
+		return fmt.Errorf("Failed to start shell: %v", err)
+	}
+
+	s.Wait()
+	return nil
+}
+
+// Get a ssh-agent AuthMethod
+func sshAgent() ssh.AuthMethod {
+	sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
+	if err != nil {
+		log.Fatalf("Failed to dial ssh-agent: %v", err)
+	}
+	return ssh.PublicKeysCallback(agent.NewClient(sshAgent).Signers)
+}
+
+// This function returns the host key for a given host (the SOS server).
+// If it can't be found, it errors
+func sshHostKey(host string) (ssh.PublicKey, error) {
+	f, err := ioutil.ReadFile(filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts"))
+	if err != nil {
+		return nil, fmt.Errorf("Can't read known_hosts file: %v", err)
+	}
+
+	for {
+		marker, hosts, pubKey, _, rest, err := ssh.ParseKnownHosts(f)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Parse error in known_hosts: %v", err)
+		}
+		if marker != "" {
+			//ignore CA or revoked key
+			fmt.Printf("ignoring marker: %s\n", marker)
+			continue
+		}
+		for _, h := range hosts {
+			if h == host {
+				return pubKey, nil
+			}
+		}
+		f = rest
+	}
+
+	return nil, fmt.Errorf("No hostkey for %s", host)
+}
+
+// This implements a http.FileSystem which only responds to specific files.
+type serveFiles struct {
+	files []string
+}
+
+// Open implements the Open method for the serveFiles FileSystem
+// implementation.
+// It converts both the name from the URL and the files provided in
+// the serveFiles structure into cleaned, absolute filesystem path and
+// only returns the file if the requested name matches one of the
+// files in the list.
+func (fs serveFiles) Open(name string) (http.File, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+
+	name = filepath.Join(cwd, filepath.FromSlash(path.Clean("/"+name)))
+	for _, fn := range fs.files {
+		fn = filepath.Join(cwd, filepath.FromSlash(path.Clean("/"+fn)))
+		if name == fn {
+			f, err := os.Open(fn)
+			if err != nil {
+				return nil, err
+			}
+			log.Debugf("Serving: %s", fn)
+			return f, nil
+		}
+	}
+	return nil, fmt.Errorf("File %s not found", name)
 }

@@ -5,7 +5,7 @@ all: default
 VERSION="0.0" # dummy for now
 GIT_COMMIT=$(shell git rev-list -1 HEAD)
 
-GO_COMPILE=linuxkit/go-compile:a1e3cd3a54b1ad683b555655282272d0eb27ee40
+GO_COMPILE=linuxkit/go-compile:7cac05c5588b3dd6a7f7bdb34fc1da90257394c7
 
 MOBY?=bin/moby
 LINUXKIT?=bin/linuxkit
@@ -20,7 +20,8 @@ endif
 
 PREFIX?=/usr/local/
 
-MOBY_COMMIT=8e720bff08cb9f20488d1ae6f114a5b1e4edf9cd
+MOBY_REPO=https://github.com/moby/tool.git
+MOBY_COMMIT=69596e17ddb01fc3d3e75774bffeb760812b2f97
 MOBY_VERSION=0.0
 bin/moby: tmp_moby_bin.tar | bin
 	tar xf $<
@@ -28,7 +29,7 @@ bin/moby: tmp_moby_bin.tar | bin
 	touch $@
 
 tmp_moby_bin.tar: Makefile
-	docker run --rm --log-driver=none -e http_proxy=$(http_proxy) -e https_proxy=$(https_proxy) $(CROSS) $(GO_COMPILE) --clone-path github.com/moby/tool --clone https://github.com/moby/tool.git --commit $(MOBY_COMMIT) --package github.com/moby/tool/cmd/moby --ldflags "-X main.GitCommit=$(MOBY_COMMIT) -X main.Version=$(MOBY_VERSION)" -o bin/moby > $@
+	docker run --rm --log-driver=none -e http_proxy=$(http_proxy) -e https_proxy=$(https_proxy) $(CROSS) $(GO_COMPILE) --clone-path github.com/moby/tool --clone $(MOBY_REPO) --commit $(MOBY_COMMIT) --package github.com/moby/tool/cmd/moby --ldflags "-X main.GitCommit=$(MOBY_COMMIT) -X main.Version=$(MOBY_VERSION)" -o bin/moby > $@
 
 RTF_COMMIT=a5c5885a833d6378fa61fcd66374cc55f0dde503
 RTF_CMD=github.com/linuxkit/rtf/cmd
@@ -41,6 +42,16 @@ bin/rtf: tmp_rtf_bin.tar | bin
 tmp_rtf_bin.tar: Makefile
 	docker run --rm --log-driver=none -e http_proxy=$(http_proxy) -e https_proxy=$(https_proxy) $(CROSS) $(GO_COMPILE) --clone-path github.com/linuxkit/rtf --clone https://github.com/linuxkit/rtf.git --commit $(RTF_COMMIT) --package github.com/linuxkit/rtf --ldflags "-X $(RTF_CMD).GitCommit=$(RTF_COMMIT) -X $(RTF_CMD).Version=$(RTF_VERSION)" -o bin/rtf > $@
 
+# Manifest tool for multi-arch images
+MT_COMMIT=bfbd11963b8e0eb5f6e400afaebeaf39820b4e90
+MT_REPO=https://github.com/estesp/manifest-tool
+bin/manifest-tool: tmp_mt_bin.tar | bin
+	tar xf $<
+	rm $<
+	touch $@
+
+tmp_mt_bin.tar: Makefile
+	docker run --rm --log-driver=none -e http_proxy=$(http_proxy) -e https_proxy=$(https_proxy) $(CROSS) $(GO_COMPILE) --clone-path github.com/estesp/manifest-tool --clone $(MT_REPO) --commit $(MT_COMMIT) --package github.com/estesp/manifest-tool --ldflags "-X main.gitCommit=$(MT_COMMIT)" -o bin/manifest-tool > $@
 
 LINUXKIT_DEPS=$(wildcard src/cmd/linuxkit/*.go) Makefile src/cmd/linuxkit/vendor.conf
 bin/linuxkit: tmp_linuxkit_bin.tar
@@ -54,11 +65,11 @@ tmp_linuxkit_bin.tar: $(LINUXKIT_DEPS)
 .PHONY: test-cross
 test-cross:
 	$(MAKE) clean
-	$(MAKE) -j 3 GOOS=darwin tmp_moby_bin.tar tmp_rtf_bin.tar tmp_linuxkit_bin.tar
+	$(MAKE) -j 3 GOOS=darwin tmp_moby_bin.tar tmp_rtf_bin.tar tmp_mt_bin.tar tmp_linuxkit_bin.tar
 	$(MAKE) clean
-	$(MAKE) -j 3 GOOS=windows tmp_moby_bin.tar tmp_rtf_bin.tar tmp_linuxkit_bin.tar
+	$(MAKE) -j 3 GOOS=windows tmp_moby_bin.tar tmp_rtf_bin.tar tmp_mt_bin.tar tmp_linuxkit_bin.tar
 	$(MAKE) clean
-	$(MAKE) -j 3 GOOS=linux tmp_moby_bin.tar tmp_rtf_bin.tar tmp_linuxkit_bin.tar
+	$(MAKE) -j 3 GOOS=linux tmp_moby_bin.tar tmp_rtf_bin.tar tmp_mt_bin.tar tmp_linuxkit_bin.tar
 	$(MAKE) clean
 
 
