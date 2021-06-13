@@ -1,5 +1,5 @@
 kernel:
-    image: "${IMAGE_PATH}"
+    image: "IMAGE_PATH"
     cmdline: "console=ttyS0"
 init:
   - linuxkit/init:v0.4

@@ -1,5 +1,5 @@
 #!/bin/bash
-#
+# NOTE: You must pass initrd as param to qemu to run the kernel!
 # $1: path to vmlinuz
 
 BASEDIR=$(dirname "$BASH_SOURCE")
