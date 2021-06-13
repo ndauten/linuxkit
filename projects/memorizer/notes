@@ -1,0 +1,15 @@
+Updates / TODO
+- Built gen_new_image script that can create new linuxkit images. Pass it a kernel config and kernel patch
+and it will create a new linux image from it. Additionally, it will update memo rizer.yml with the updated image name.
+
+- Added memorizer_default.yml. Once we have a specific "default" kernel config, we can create a linuxkit image that
+  is prebuilt. The  image would reside on Dockerhub and end users wouldn't need to ever supply own kernel configuration.
+
+- build_from_yml.sh and build_from_default.sh use a custom Linuxkit image, or default Linuxkit image of Memorizer, and build them locally to run.
+
+- run_memorizer.sh: Given that a build succeeded, it will run the image in QEMU.
+
+- Questions for Bruce and Nathan:
+   - When running Memorizer on QEMU, you need to pass it a initramfs. Right now this is defaulting to a root fs in Bruce and I's home directories (~/rootfs.cpio.gz)
+    Do y'all want to publish this? Is this file something that should be generated during the kernel build process?
+   - Sanity check that these scripts work would be appreciated.  
