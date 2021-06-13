@@ -1,0 +1,19 @@
+kernel:
+    image: "linuxkitprojects/kernel-memorizer:4.10_dbg-e15d5497dd33bd33dac04bc442cfd9ba9442f092-dirty"
+    cmdline: "console=ttyS0"
+init:
+  - linuxkit/init:v0.4
+  - linuxkit/runc:v0.4
+  - linuxkit/containerd:v0.4
+onboot:
+  - name: dhcpcd
+    image: linuxkit/dhcpcd:v0.4
+    command: ["/sbin/dhcpcd", "--nobackground", "-f", "/dhcpcd.conf", "-1"]
+services:
+  - name: getty
+    image: linuxkit/getty:v0.4
+    env:
+     - INSECURE=true
+trust:
+  org:
+    - linuxkit
