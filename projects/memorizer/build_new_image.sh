@@ -4,6 +4,10 @@
 # $1: Path to kernel configuration
 # $2: Path to kernel patch file.
 
+if [ "$1" == "" ] || [ $# -et 0 ] || [ "$2" == ""] || [$2 -eq 0]; then
+            echo "./build_new_image [KERNEL_CONFIG_PATH] [KERNEL_PATCH_PATH]"
+            exit
+fi
 # Copy kernel configuration into directory:
 mv $1 ./kernel-memorizer/kerner_config-4.10.x
 
@@ -26,6 +30,4 @@ if [ $? -eq 0 ]; then
    else
           echo "BUILD FAILED!"
 fi
-
-
 
