@@ -1,15 +1,19 @@
 Updates / TODO
 - Built gen_new_image script that can create new linuxkit images. Pass it a kernel config and kernel patch
-and it will create a new linux image from it. Additionally, it will update memo rizer.yml with the updated image name.
+and it will create a new Memorizer image from it. Additionally, it will update memorizer.yml with the updated image name.
+
+- Created build_from_yml.sh and build_from_default.sh. Given a custom Linuxkit image (denoted in memorizer.yml), or default Linuxkit image of Memorizer (denoted in memorizer_default.yml), the scripts pull the 
+images and build them locally.
 
 - Added memorizer_default.yml. Once we have a specific "default" kernel config, we can create a linuxkit image that
-  is prebuilt. The  image would reside on Dockerhub and end users wouldn't need to ever supply own kernel configuration.
-
-- build_from_yml.sh and build_from_default.sh use a custom Linuxkit image, or default Linuxkit image of Memorizer, and build them locally to run.
-
-- run_memorizer.sh: Given that a build succeeded, it will run the image in QEMU.
-
+  is prebuilt. The  image would reside on Dockerhub and end users wouldn't need to supply their own kernel configuration.
+- run_memorizer.sh: Given that ./build_from_yml.sh or ./build_from_default.sh succeeded, this script will run the image in QEMU.
 - Questions for Bruce and Nathan:
    - When running Memorizer on QEMU, you need to pass it a initramfs. Right now this is defaulting to a root fs in Bruce and I's home directories (~/rootfs.cpio.gz)
     Do y'all want to publish this? Is this file something that should be generated during the kernel build process?
    - Sanity check that these scripts work would be appreciated.  
+    - When booting in QEMU, it prompts for a "Buildroot" login and password. One can login using "root" as username
+      and nothing for the password. Is this supposed to be here?
+        - I ran into an issue that qemu needs a number of command line arguments to run Memorizer that "linuxkit run qemu..." wont include.
+          As a result, ./run_memorizer runs using qemu directly instead of the linuxkit wrapper around QEMU.
+        - I'm concerned that this "Buildroot" login is really logging in to a VM used by Linuxkit to build a kernel, not the kernel itself.
