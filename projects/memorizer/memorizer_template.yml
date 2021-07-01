@@ -1,5 +1,5 @@
 kernel:
-    image: "linuxkitprojects/kernel-memorizer:4.10_dbg-a2939a5858b8f613b7afb442e40b57897f75fda5-dirty"
+    image: "IMAGE_PATH"
     cmdline: "console=ttyS0"
 init:
   - linuxkit/init:v0.4
